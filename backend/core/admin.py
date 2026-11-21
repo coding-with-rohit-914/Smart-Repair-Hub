@@ -69,3 +69,5 @@ class ReviewAdmin(admin.ModelAdmin):
 class NotificationAdmin(admin.ModelAdmin):
     list_display = ("recipient", "title", "is_read", "created_at")
     list_filter = ("is_read",)
+
+admin.site.register(User, UserAdmin)
