@@ -131,6 +131,15 @@ SIMPLE_JWT = {
 
 
 # CORS Configuration
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        ""
+    ).split(",")
+    if origin.strip()
+]
+
 CORS_ALLOW_ALL_ORIGINS = DEBUG
 CORS_ALLOW_CREDENTIALS = True
 
@@ -168,6 +177,7 @@ STORAGES = {
 
 # Default primary key field type
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
 
 # Logging Configuration
 LOGGING = {
