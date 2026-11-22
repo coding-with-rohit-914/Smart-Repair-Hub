@@ -18,7 +18,7 @@ from rest_framework import generics, serializers
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
+from django.core.mail import send_mail
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
@@ -539,10 +539,34 @@ class RequestPasswordOtpView(APIView):
             ]
         )
 
+        try:
+            send_mail(
+                subject="Smart Repair Hub — Password Reset Code",
+                message=(f"Your password reset code is: {otp}\n\n"
+                    "This code expires in 10 minutes.\n"
+                    "If you did not request a password reset, "
+                    "you can safely ignore this email."
+                ),
+                from_email=None,  # uses DEFAULT_FROM_EMAIL from settings
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+        except Exception:
+            # Log the failure with full traceback; never expose internals
+            # to the API caller beyond a generic message.
+            logger.exception(
+                "Password reset OTP email failed (user_id=%s).",
+                user.pk,
+            )
+            return Response(
+                {"error": "Could not send the email right now. Please try again."},
+                status=500,
+            )
+        # Optional: also keep the in-app notification record
         notify(
             user,
             "Password Reset",
-            f"Your password reset code is {otp}",
+            "A password reset code was sent to your email.",
         )
 
         logger.info(
