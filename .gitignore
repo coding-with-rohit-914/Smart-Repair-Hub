@@ -1,14 +1,58 @@
+# ===== Python / Django =====
 venv/
+.venv/
 __pycache__/
-*.pyc
-db.sqlite3
-media/
-staticfiles/
+*.py[cod]
+*.egg-info/
+*.egg
+pip-log.txt
+
+# ===== Secrets / environment =====
 .env
+.env.local
+.env.production
+*.pem
+*.key
+
+# ===== Django runtime artifacts =====
+db.sqlite3
+db.sqlite3-journal
+backend/media/
+backend/staticfiles/
+backend/logs/
+*.log
+
+# ===== Flutter / Dart =====
 .dart_tool/
-build/
+.flutter-plugins
+.flutter-plugins-dependencies
 mobile/.flutter-plugins*
 mobile/.metadata
+mobile/.packages
+mobile/.idea/
+mobile/.dart_tool/
+mobile/build/
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/key.properties
+*.aab
+
+# Generated APKs (keep source, never commit binaries)
+mobile/build/app/outputs/**/*.apk
+
+# Flutter runtime flag files
+mobile/*.isLoggedIn
+*.g.dart.lock
+
+# ===== IDE / editors =====
 .idea/
 .vscode/
-*.log
+*.iml
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===== OS / temp =====
+*.tmp
+*.bak
+~

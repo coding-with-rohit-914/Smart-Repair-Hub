@@ -1,4 +1,6 @@
 
+from drf_spectacular.utils import extend_schema_field
+
 from rest_framework import serializers
 
 from .models import (
@@ -14,7 +16,10 @@ from .models import (
 
 
 class UserSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(
+        write_only=True,
+        min_length=6,
+    )
 
     class Meta:
         model = User
@@ -44,7 +49,50 @@ class ProfileSerializer(serializers.ModelSerializer):
             "last_name",
             "avatar",
         )
-        read_only_fields = ("id", "role")
+        read_only_fields = (
+            "id",
+            "role",
+        )
+
+
+class ServiceSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(
+        source="category.name",
+        read_only=True,
+    )
+
+    class Meta:
+        model = Service
+        fields = (
+            "id",
+            "category",
+            "category_name",
+            "name",
+            "base_price",
+            "description",
+            "is_active",
+        )
+
+
+class CategorySerializer(serializers.ModelSerializer):
+    services = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ApplianceCategory
+        fields = (
+            "id",
+            "name",
+            "icon",
+            "description",
+            "services",
+        )
+
+    @extend_schema_field(ServiceSerializer(many=True))
+    def get_services(self, obj):
+        return ServiceSerializer(
+            obj.services.filter(is_active=True),
+            many=True,
+        ).data
 
 
 class TechnicianProfileSerializer(serializers.ModelSerializer):
@@ -99,47 +147,9 @@ class TechnicianProfileSerializer(serializers.ModelSerializer):
             "rating_count",
         )
 
+    @extend_schema_field(serializers.CharField())
     def get_full_name(self, obj):
         return obj.user.get_full_name()
-
-
-class CategorySerializer(serializers.ModelSerializer):
-    services = serializers.SerializerMethodField()
-
-    class Meta:
-        model = ApplianceCategory
-        fields = (
-            "id",
-            "name",
-            "icon",
-            "description",
-            "services",
-        )
-
-    def get_services(self, obj):
-        return ServiceSerializer(
-            obj.services.filter(is_active=True),
-            many=True,
-        ).data
-
-
-class ServiceSerializer(serializers.ModelSerializer):
-    category_name = serializers.CharField(
-        source="category.name",
-        read_only=True,
-    )
-
-    class Meta:
-        model = Service
-        fields = (
-            "id",
-            "category",
-            "category_name",
-            "name",
-            "base_price",
-            "description",
-            "is_active",
-        )
 
 
 class BookingCreateSerializer(serializers.ModelSerializer):
@@ -190,12 +200,14 @@ class BookingSerializer(serializers.ModelSerializer):
             "technician_notes",
         )
 
+    @extend_schema_field(serializers.BooleanField())
     def get_has_payment(self, obj):
         return (
             hasattr(obj, "payment")
             and obj.payment.status == Payment.Status.SUCCESS
         )
 
+    @extend_schema_field(serializers.BooleanField())
     def get_has_review(self, obj):
         return hasattr(obj, "review")
 

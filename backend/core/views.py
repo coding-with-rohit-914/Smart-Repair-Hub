@@ -1,16 +1,25 @@
 
 """API views: auth (JWT/OTP), categories, bookings, payments, reviews, notifications."""
 
+import logging
 import math
+import os
+import secrets
 
 from django.contrib.auth import authenticate
+from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
+
+from drf_spectacular.utils import extend_schema
 
 from rest_framework import generics, serializers
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     ApplianceCategory,
@@ -38,6 +47,113 @@ from .serializers import (
 )
 
 
+logger = logging.getLogger("core")
+
+# Dev-only override: when "True", OTP responses include the OTP so you can
+# test locally without console/SMS. NEVER enable in production.
+OTP_DEV_MODE = os.getenv("OTP_DEV_MODE", "False").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+# --------------------------------------------------
+# SCHEMA-ONLY SERIALIZERS
+# --------------------------------------------------
+
+class _LoginRequestSerializer(serializers.Serializer):
+    username = serializers.CharField()
+    password = serializers.CharField()
+
+
+class _RegisterRequestSerializer(serializers.Serializer):
+    username = serializers.CharField()
+    password = serializers.CharField()
+    email = serializers.EmailField(required=False, allow_blank=True)
+    phone = serializers.CharField(required=False, allow_blank=True)
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
+    role = serializers.ChoiceField(
+        choices=User.Role.choices,
+        required=False,
+        default=User.Role.CUSTOMER,
+    )
+
+
+class _OtpRequestSerializer(serializers.Serializer):
+    phone = serializers.CharField()
+
+
+class _OtpVerifyRequestSerializer(serializers.Serializer):
+    phone = serializers.CharField()
+    otp = serializers.CharField()
+
+
+class _ChangePasswordRequestSerializer(serializers.Serializer):
+    old_password = serializers.CharField()
+    new_password = serializers.CharField()
+
+
+class _PasswordResetOtpRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
+class _PasswordResetOtpVerifySerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    otp = serializers.CharField()
+
+
+class _PasswordResetSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    otp = serializers.CharField()
+    new_password = serializers.CharField()
+
+
+class _AuthResponseSerializer(serializers.Serializer):
+    access = serializers.CharField()
+    refresh = serializers.CharField()
+    user = UserSerializer()
+
+
+class _MessageResponseSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+
+
+class _AssignTechnicianRequestSerializer(serializers.Serializer):
+    technician_id = serializers.IntegerField()
+
+
+class _NearbyTechnicianSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    distance_km = serializers.FloatField(allow_null=True)
+    rating = serializers.FloatField(allow_null=True)
+
+
+class _CheckoutSerializer(serializers.Serializer):
+    gateway = serializers.CharField()
+    order_id = serializers.CharField()
+    amount = serializers.FloatField()
+    note = serializers.CharField()
+
+
+class _StartPaymentResponseSerializer(serializers.Serializer):
+    payment = PaymentSerializer()
+    checkout = _CheckoutSerializer()
+
+
+class _PaymentResponseSerializer(serializers.Serializer):
+    payment = PaymentSerializer()
+
+
+class _EarningsResponseSerializer(serializers.Serializer):
+    total_earnings = serializers.FloatField()
+    completed_jobs = serializers.IntegerField()
+    paid_jobs = serializers.IntegerField()
+    rating_avg = serializers.FloatField(allow_null=True)
+
+
 # --------------------------------------------------
 # AUTHENTICATION
 # --------------------------------------------------
@@ -45,6 +161,10 @@ from .serializers import (
 class RegisterView(APIView):
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        request=_RegisterRequestSerializer,
+        responses={201: UserSerializer, 400: None},
+    )
     def post(self, request):
         serializer = UserSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -81,6 +201,12 @@ class RegisterView(APIView):
         if role == User.Role.TECHNICIAN:
             TechnicianProfile.objects.create(user=user)
 
+        logger.info(
+            "New user registered (user_id=%s, role=%s).",
+            user.pk,
+            role,
+        )
+
         return Response(
             UserSerializer(user).data,
             status=201,
@@ -90,6 +216,10 @@ class RegisterView(APIView):
 class LoginView(APIView):
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        request=_LoginRequestSerializer,
+        responses={200: _AuthResponseSerializer, 401: None},
+    )
     def post(self, request):
         username = request.data.get("username", "").strip()
         password = request.data.get("password", "")
@@ -101,6 +231,12 @@ class LoginView(APIView):
         )
 
         if user is None:
+            # Log the username only; NEVER the password.
+            logger.warning(
+                "Failed login attempt (username=%s, ip=%s).",
+                username,
+                request.META.get("REMOTE_ADDR", "unknown"),
+            )
             return Response(
                 {"error": "Invalid credentials."},
                 status=401,
@@ -118,14 +254,22 @@ class LoginView(APIView):
                 and profile.approval_status
                 == TechnicianProfile.ApprovalStatus.REJECTED
             ):
+                logger.warning(
+                    "Rejected technician login blocked (user_id=%s).",
+                    user.pk,
+                )
                 return Response(
                     {"error": "Your technician account was rejected."},
                     status=403,
                 )
 
-        from rest_framework_simplejwt.tokens import RefreshToken
-
         refresh = RefreshToken.for_user(user)
+
+        logger.info(
+            "Login successful (user_id=%s, role=%s).",
+            user.pk,
+            user.role,
+        )
 
         return Response({
             "access": str(refresh.access_token),
@@ -137,6 +281,14 @@ class LoginView(APIView):
 class RequestOTPView(APIView):
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        request=_OtpRequestSerializer,
+        responses={
+            200: _MessageResponseSerializer,
+            404: None,
+            429: None,
+        },
+    )
     def post(self, request):
         phone = request.data.get("phone", "").strip()
 
@@ -148,6 +300,22 @@ class RequestOTPView(APIView):
                 status=404,
             )
 
+        # Rate limit resend abuse.
+        if user.otp_in_cooldown():
+            logger.warning(
+                "OTP resend blocked by cooldown (user_id=%s).",
+                user.pk,
+            )
+            return Response(
+                {
+                    "error": (
+                        "Please wait before requesting another OTP. "
+                        f"Try again in {user.OTP_RESEND_COOLDOWN_SECONDS} seconds."
+                    )
+                },
+                status=429,
+            )
+
         otp = user.generate_otp()
 
         notify(
@@ -156,27 +324,76 @@ class RequestOTPView(APIView):
             f"Your verification code is {otp}",
         )
 
-        # Development only: do not expose OTP in production.
-        return Response({
-            "detail": "OTP sent.",
-            "otp": otp,
-        })
+        logger.info(
+            "Phone OTP generated (user_id=%s).",
+            user.pk,
+        )  # OTP value never logged
+
+        response = {"detail": "OTP sent."}
+
+        if OTP_DEV_MODE:
+            # Local development convenience only.
+            response["otp"] = otp
+
+        return Response(response)
 
 
 class VerifyOTPView(APIView):
     permission_classes = [AllowAny]
 
+    @extend_schema(
+        request=_OtpVerifyRequestSerializer,
+        responses={
+            200: _AuthResponseSerializer,
+            400: None,
+            404: None,
+            429: None,
+        },
+    )
     def post(self, request):
         phone = request.data.get("phone", "").strip()
         otp = request.data.get("otp", "").strip()
 
         user = User.objects.filter(phone=phone).first()
 
-        if (
-            not user
-            or not user.otp_code
-            or user.otp_code != otp
-        ):
+        if not user:
+            return Response(
+                {"error": "No account with this phone number."},
+                status=404,
+            )
+
+        # Expiry check.
+        if user.otp_is_expired():
+            logger.warning(
+                "Expired phone OTP rejected (user_id=%s).",
+                user.pk,
+            )
+            return Response(
+                {"error": "OTP has expired. Please request a new one."},
+                status=400,
+            )
+
+        # Attempt limit (brute-force protection).
+        if user.otp_attempts >= user.OTP_MAX_ATTEMPTS:
+            logger.warning(
+                "Phone OTP attempts exhausted (user_id=%s).",
+                user.pk,
+            )
+            return Response(
+                {"error": "Too many wrong attempts. Please request a new OTP."},
+                status=429,
+            )
+
+        if not user.otp_code or user.otp_code != otp:
+            user.otp_attempts += 1
+            user.save(update_fields=["otp_attempts"])
+
+            logger.warning(
+                "Wrong phone OTP entered (user_id=%s, attempt=%s).",
+                user.pk,
+                user.otp_attempts,
+            )
+
             return Response(
                 {"error": "Invalid OTP."},
                 status=400,
@@ -184,17 +401,22 @@ class VerifyOTPView(APIView):
 
         user.is_phone_verified = True
         user.otp_code = ""
+        user.otp_attempts = 0
 
         user.save(
             update_fields=[
                 "is_phone_verified",
                 "otp_code",
+                "otp_attempts",
             ]
         )
 
-        from rest_framework_simplejwt.tokens import RefreshToken
-
         refresh = RefreshToken.for_user(user)
+
+        logger.info(
+            "Phone OTP verified (user_id=%s).",
+            user.pk,
+        )
 
         return Response({
             "access": str(refresh.access_token),
@@ -215,6 +437,11 @@ class ProfileView(generics.RetrieveUpdateAPIView):
 
 
 class ChangePasswordView(APIView):
+
+    @extend_schema(
+        request=_ChangePasswordRequestSerializer,
+        responses={200: _MessageResponseSerializer, 400: None},
+    )
     def post(self, request):
         old_password = request.data.get("old_password", "")
         new_password = request.data.get("new_password", "")
@@ -234,8 +461,261 @@ class ChangePasswordView(APIView):
         request.user.set_password(new_password)
         request.user.save()
 
+        logger.info(
+            "Password changed (user_id=%s).",
+            request.user.pk,
+        )
+
         return Response({
             "detail": "Password changed.",
+        })
+
+
+# --------------------------------------------------
+# FORGOT PASSWORD (EMAIL OTP)
+# --------------------------------------------------
+
+class RequestPasswordOtpView(APIView):
+    """Forgot password, step 1: email -> hashed reset OTP."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        request=_PasswordResetOtpRequestSerializer,
+        responses={
+            200: _MessageResponseSerializer,
+            429: None,
+        },
+    )
+    def post(self, request):
+        email = request.data.get("email", "").strip().lower()
+
+        user = User.objects.filter(email=email).first()
+
+        # Generic response: never reveal whether the email is registered.
+        generic = {
+            "detail": (
+                "If an account with this email exists, "
+                "a password reset code has been sent."
+            )
+        }
+
+        if not user:
+            logger.info(
+                "Password reset OTP requested for unknown email.",
+            )
+            return Response(generic)
+
+        # Resend cooldown (same constant as the phone OTP flow).
+        if user.otp_in_cooldown():
+            logger.warning(
+                "Password reset OTP resend blocked by cooldown (user_id=%s).",
+                user.pk,
+            )
+            return Response(
+                {
+                    "error": (
+                        "Please wait before requesting another code. "
+                        f"Try again in {user.OTP_RESEND_COOLDOWN_SECONDS} seconds."
+                    )
+                },
+                status=429,
+            )
+
+        otp = f"{secrets.randbelow(1000000):06d}"
+
+        # Store only the PBKDF2 hash of the OTP, never the OTP itself.
+        user.otp_hash = make_password(otp)
+        user.otp_purpose = "PASSWORD_RESET"
+        user.otp_attempts = 0
+        user.otp_requested_at = timezone.now()
+
+        user.save(
+            update_fields=[
+                "otp_hash",
+                "otp_purpose",
+                "otp_attempts",
+                "otp_requested_at",
+            ]
+        )
+
+        notify(
+            user,
+            "Password Reset",
+            f"Your password reset code is {otp}",
+        )
+
+        logger.info(
+            "Password reset OTP generated (user_id=%s).",
+            user.pk,
+        )  # OTP value never logged
+
+        response = dict(generic)
+
+        if OTP_DEV_MODE:
+            # Local development convenience only.
+            response["otp"] = otp
+
+        return Response(response)
+
+
+class VerifyPasswordOtpView(APIView):
+    """Forgot password, step 2: confirm the code before showing the
+    new-password form. The OTP stays valid for the final reset call."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        request=_PasswordResetOtpVerifySerializer,
+        responses={
+            200: _MessageResponseSerializer,
+            400: None,
+            429: None,
+        },
+    )
+    def post(self, request):
+        email = request.data.get("email", "").strip().lower()
+        otp = request.data.get("otp", "").strip()
+
+        user = User.objects.filter(email=email).first()
+
+        if (
+            not user
+            or not user.otp_hash
+            or user.otp_purpose != "PASSWORD_RESET"
+        ):
+            return Response(
+                {"error": "Invalid or expired code."},
+                status=400,
+            )
+
+        if user.otp_requested_at is None or user.otp_is_expired():
+            return Response(
+                {"error": "This code has expired. Please request a new one."},
+                status=400,
+            )
+
+        if user.otp_attempts >= user.OTP_MAX_ATTEMPTS:
+            logger.warning(
+                "Password reset OTP attempts exhausted (user_id=%s).",
+                user.pk,
+            )
+            return Response(
+                {"error": "Too many wrong attempts. Please request a new code."},
+                status=429,
+            )
+
+        if not check_password(otp, user.otp_hash):
+            user.otp_attempts += 1
+            user.save(update_fields=["otp_attempts"])
+
+            logger.warning(
+                "Wrong password reset OTP entered (user_id=%s, attempt=%s).",
+                user.pk,
+                user.otp_attempts,
+            )
+
+            return Response(
+                {"error": "Invalid code."},
+                status=400,
+            )
+
+        # Code is live; reset re-verifies it. Reset attempts so the user
+        # gets full tries on the final reset call.
+        user.otp_attempts = 0
+        user.save(update_fields=["otp_attempts"])
+
+        return Response({
+            "detail": "Code verified. You can now set a new password.",
+        })
+
+
+class ResetPasswordView(APIView):
+    """Forgot password, step 3: OTP + new password -> password changed."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        request=_PasswordResetSerializer,
+        responses={
+            200: _MessageResponseSerializer,
+            400: None,
+            429: None,
+        },
+    )
+    def post(self, request):
+        email = request.data.get("email", "").strip().lower()
+        otp = request.data.get("otp", "").strip()
+        new_password = request.data.get("new_password", "")
+
+        user = User.objects.filter(email=email).first()
+
+        if (
+            not user
+            or not user.otp_hash
+            or user.otp_purpose != "PASSWORD_RESET"
+        ):
+            return Response(
+                {"error": "Invalid or expired code."},
+                status=400,
+            )
+
+        if user.otp_requested_at is None or user.otp_is_expired():
+            return Response(
+                {"error": "This code has expired. Please request a new one."},
+                status=400,
+            )
+
+        if user.otp_attempts >= user.OTP_MAX_ATTEMPTS:
+            return Response(
+                {"error": "Too many wrong attempts. Please request a new code."},
+                status=429,
+            )
+
+        if not check_password(otp, user.otp_hash):
+            user.otp_attempts += 1
+            user.save(update_fields=["otp_attempts"])
+
+            logger.warning(
+                "Wrong password reset OTP on reset (user_id=%s, attempt=%s).",
+                user.pk,
+                user.otp_attempts,
+            )
+
+            return Response(
+                {"error": "Invalid code."},
+                status=400,
+            )
+
+        if len(new_password) < 6:
+            return Response(
+                {"error": "New password too short."},
+                status=400,
+            )
+
+        user.set_password(new_password)
+
+        # Burn the OTP so it can never be reused.
+        user.otp_hash = ""
+        user.otp_purpose = ""
+        user.otp_attempts = 0
+
+        user.save(
+            update_fields=[
+                "password",
+                "otp_hash",
+                "otp_purpose",
+                "otp_attempts",
+            ]
+        )
+
+        logger.info(
+            "Password reset via OTP (user_id=%s).",
+            user.pk,
+        )
+
+        return Response({
+            "detail": "Password reset successful. Please log in with your new password.",
         })
 
 
@@ -419,6 +899,13 @@ class TechnicianProfileView(generics.RetrieveUpdateAPIView):
 class AvailableTechniciansView(APIView):
     """Suggest nearby approved technicians for a booking."""
 
+    @extend_schema(
+        responses={
+            200: _NearbyTechnicianSerializer(many=True),
+            403: None,
+            404: None,
+        },
+    )
     def get(self, request, pk):
         booking = Booking.objects.filter(pk=pk).first()
 
@@ -511,6 +998,16 @@ class BookingActionView(APIView):
         ),
     }
 
+    @extend_schema(
+        operation_id="booking_action",
+        request=None,
+        responses={
+            200: BookingSerializer,
+            400: None,
+            403: None,
+            404: None,
+        },
+    )
     def post(self, request, pk, action):
         if action not in self.ACTIONS:
             return Response(
@@ -661,6 +1158,15 @@ class BookingActionView(APIView):
 
 class CancelBookingView(APIView):
 
+    @extend_schema(
+        request=None,
+        responses={
+            200: BookingSerializer,
+            400: None,
+            403: None,
+            404: None,
+        },
+    )
     def post(self, request, pk):
         booking = Booking.objects.filter(pk=pk).first()
 
@@ -721,6 +1227,15 @@ class CancelBookingView(APIView):
 class AssignTechnicianView(APIView):
     """Admin manually assigns a technician."""
 
+    @extend_schema(
+        request=_AssignTechnicianRequestSerializer,
+        responses={
+            200: BookingSerializer,
+            400: None,
+            403: None,
+            404: None,
+        },
+    )
     def post(self, request, pk):
         user = request.user
 
@@ -798,6 +1313,15 @@ class AssignTechnicianView(APIView):
 class StartPaymentView(APIView):
     """Creates a payment record. Mock gateway only."""
 
+    @extend_schema(
+        request=None,
+        responses={
+            200: _StartPaymentResponseSerializer,
+            400: None,
+            403: None,
+            404: None,
+        },
+    )
     def post(self, request, pk):
         booking = Booking.objects.filter(pk=pk).first()
 
@@ -860,6 +1384,15 @@ class StartPaymentView(APIView):
 
 class ConfirmPaymentView(APIView):
 
+    @extend_schema(
+        request=None,
+        responses={
+            200: _PaymentResponseSerializer,
+            400: None,
+            403: None,
+            404: None,
+        },
+    )
     def post(self, request, pk):
         booking = Booking.objects.filter(pk=pk).first()
 
@@ -927,6 +1460,12 @@ class ConfirmPaymentView(APIView):
             ),
         )
 
+        logger.info(
+            "Payment confirmed (booking=%s, transaction=%s).",
+            booking.booking_id,
+            payment.transaction_id,
+        )
+
         return Response({
             "payment": PaymentSerializer(payment).data,
         })
@@ -982,6 +1521,13 @@ class MyNotificationsView(generics.ListAPIView):
 
 class MarkNotificationReadView(APIView):
 
+    @extend_schema(
+        request=None,
+        responses={
+            200: _MessageResponseSerializer,
+            404: None,
+        },
+    )
     def post(self, request, pk):
         notification = (
             request.user.notifications
@@ -1012,6 +1558,12 @@ class MarkNotificationReadView(APIView):
 
 class TechnicianEarningsView(APIView):
 
+    @extend_schema(
+        responses={
+            200: _EarningsResponseSerializer,
+            403: None,
+        },
+    )
     def get(self, request):
         profile = getattr(
             request.user,

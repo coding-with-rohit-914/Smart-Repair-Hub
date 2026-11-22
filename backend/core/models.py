@@ -1,11 +1,16 @@
+
 """Core models: users, categories, services, bookings, payments, reviews, notifications."""
+
 import random
 import secrets
+from datetime import timedelta
 
 from django.conf import settings
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db import models
+from django.utils import timezone
 
 
 class User(AbstractUser):
@@ -14,20 +19,112 @@ class User(AbstractUser):
         TECHNICIAN = "TECHNICIAN", "Technician"
         ADMIN = "ADMIN", "Admin"
 
-    role = models.CharField(max_length=20, choices=Role.choices, default=Role.CUSTOMER)
+    role = models.CharField(
+        max_length=20,
+        choices=Role.choices,
+        default=Role.CUSTOMER,
+    )
     phone = models.CharField(max_length=15, blank=True, default="")
+
+    # Legacy phone-OTP fields (kept for DB compatibility; new flows use otp_hash)
     otp_code = models.CharField(max_length=6, blank=True, default="")
     otp_requested_at = models.DateTimeField(null=True, blank=True)
     is_phone_verified = models.BooleanField(default=False)
+
+    # Secure hashed OTP (new — Step 2 migration adds these columns)
+    otp_hash = models.CharField(max_length=255, blank=True, default="")
+    otp_purpose = models.CharField(max_length=20, blank=True, default="")
+    otp_attempts = models.PositiveSmallIntegerField(default=0)
+
     avatar = models.ImageField(upload_to="avatars/", blank=True, null=True)
+
+    # OTP security policy
+    OTP_EXPIRY_MINUTES = 10
+    OTP_MAX_ATTEMPTS = 5
+    OTP_RESEND_COOLDOWN_SECONDS = 60
 
     def __str__(self):
         return f"{self.get_full_name() or self.username} ({self.role})"
 
+    # Legacy OTP (phone) — timestamp bug fixed
     def generate_otp(self):
         self.otp_code = f"{random.randint(100000, 999999)}"
+        self.otp_requested_at = timezone.now()
         self.save(update_fields=["otp_code", "otp_requested_at"])
         return self.otp_code
+
+    # Secure hashed OTP (email / password reset)
+    def set_otp(self, purpose):
+        """Generate a 6-digit OTP for a purpose, store only its hash."""
+        raw = f"{random.randint(100000, 999999)}"
+        self.otp_hash = make_password(raw)
+        self.otp_purpose = purpose
+        self.otp_requested_at = timezone.now()
+        self.otp_attempts = 0
+        self.otp_code = ""  # clear legacy field
+        self.save(
+            update_fields=[
+                "otp_hash",
+                "otp_purpose",
+                "otp_requested_at",
+                "otp_attempts",
+                "otp_code",
+            ]
+        )
+        return raw
+
+    def otp_in_cooldown(self):
+        if not self.otp_requested_at:
+            return False
+        elapsed = (timezone.now() - self.otp_requested_at).total_seconds()
+        return elapsed < self.OTP_RESEND_COOLDOWN_SECONDS
+
+    def otp_is_expired(self):
+        if not self.otp_requested_at:
+            return True
+        return (
+            timezone.now() - self.otp_requested_at
+            > timedelta(minutes=self.OTP_EXPIRY_MINUTES)
+        )
+
+    def check_otp(self, raw, purpose):
+        """Validate an OTP. Returns (ok: bool, error: str)."""
+        from django.contrib.auth.hashers import check_password
+
+        if not self.otp_hash:
+            return False, "No OTP requested. Please request one first."
+
+        if self.otp_purpose != purpose:
+            return False, "Invalid OTP."
+
+        if self.otp_attempts >= self.OTP_MAX_ATTEMPTS:
+            self.clear_otp()
+            return False, "Too many wrong attempts. Please request a new OTP."
+
+        if self.otp_is_expired():
+            self.clear_otp()
+            return False, "OTP has expired. Please request a new one."
+
+        if not check_password(raw or "", self.otp_hash):
+            self.otp_attempts += 1
+            self.save(update_fields=["otp_attempts"])
+            return False, "Invalid OTP."
+
+        return True, ""
+
+    def clear_otp(self):
+        self.otp_hash = ""
+        self.otp_purpose = ""
+        self.otp_code = ""
+        self.otp_attempts = 0
+        self.save(
+            update_fields=[
+                "otp_hash",
+                "otp_purpose",
+                "otp_code",
+                "otp_attempts",
+            ]
+        )
 
 
 class ApplianceCategory(models.Model):
@@ -44,7 +141,11 @@ class ApplianceCategory(models.Model):
 
 
 class Service(models.Model):
-    category = models.ForeignKey(ApplianceCategory, on_delete=models.CASCADE, related_name="services")
+    category = models.ForeignKey(
+        ApplianceCategory,
+        on_delete=models.CASCADE,
+        related_name="services",
+    )
     name = models.CharField(max_length=100)
     base_price = models.DecimalField(max_digits=10, decimal_places=2)
     description = models.TextField(blank=True, default="")
@@ -63,8 +164,15 @@ class TechnicianProfile(models.Model):
         APPROVED = "APPROVED", "Approved"
         REJECTED = "REJECTED", "Rejected"
 
-    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="technician_profile")
-    expertise = models.ManyToManyField(ApplianceCategory, related_name="technicians")
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="technician_profile",
+    )
+    expertise = models.ManyToManyField(
+        ApplianceCategory,
+        related_name="technicians",
+    )
     experience_years = models.PositiveIntegerField(default=0)
     photo = models.ImageField(upload_to="technicians/", blank=True, null=True)
     bio = models.TextField(blank=True, default="")
@@ -73,7 +181,9 @@ class TechnicianProfile(models.Model):
     longitude = models.FloatField(blank=True, null=True)
     is_available = models.BooleanField(default=True)
     approval_status = models.CharField(
-        max_length=10, choices=ApprovalStatus.choices, default=ApprovalStatus.PENDING
+        max_length=10,
+        choices=ApprovalStatus.choices,
+        default=ApprovalStatus.PENDING,
     )
     rating_avg = models.FloatField(default=0.0)
     rating_count = models.PositiveIntegerField(default=0)
@@ -84,7 +194,11 @@ class TechnicianProfile(models.Model):
     def recalc_rating(self):
         reviews = self.reviews.all()
         self.rating_count = reviews.count()
-        self.rating_avg = round(sum(r.rating for r in reviews) / reviews.count(), 2) if reviews else 0.0
+        self.rating_avg = (
+            round(sum(r.rating for r in reviews) / reviews.count(), 2)
+            if reviews
+            else 0.0
+        )
         self.save(update_fields=["rating_avg", "rating_count"])
 
 
@@ -103,11 +217,33 @@ class BookingStatus(models.TextChoices):
 
 
 class Booking(models.Model):
-    booking_id = models.CharField(max_length=20, unique=True, editable=False)
-    customer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="bookings")
-    service = models.ForeignKey(Service, on_delete=models.PROTECT, related_name="bookings")
-    technician = models.ForeignKey(TechnicianProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name="bookings")
-    status = models.CharField(max_length=15, choices=BookingStatus.choices, default=BookingStatus.PENDING)
+    booking_id = models.CharField(
+        max_length=20,
+        unique=True,
+        editable=False,
+    )
+    customer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="bookings",
+    )
+    service = models.ForeignKey(
+        Service,
+        on_delete=models.PROTECT,
+        related_name="bookings",
+    )
+    technician = models.ForeignKey(
+        TechnicianProfile,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="bookings",
+    )
+    status = models.CharField(
+        max_length=15,
+        choices=BookingStatus.choices,
+        default=BookingStatus.PENDING,
+    )
     problem_description = models.TextField()
     preferred_date = models.DateField()
     preferred_slot = models.CharField(max_length=20)
@@ -116,8 +252,17 @@ class Booking(models.Model):
     longitude = models.FloatField(blank=True, null=True)
     images = models.ImageField(upload_to="bookings/", blank=True, null=True)
     instructions = models.TextField(blank=True, default="")
-    estimated_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    final_amount = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
+    estimated_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=0,
+    )
+    final_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        blank=True,
+        null=True,
+    )
     technician_notes = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -127,7 +272,10 @@ class Booking(models.Model):
             # SRV-2026-00125 style ID
             prefix = f"SRV-{self.created_at.year if self.created_at else ''}"
             while True:
-                code = f"SRV-{secrets.token_hex(2).upper()}-{random.randint(1000, 9999)}"
+                code = (
+                    f"SRV-{secrets.token_hex(2).upper()}-"
+                    f"{random.randint(1000, 9999)}"
+                )
                 if not Booking.objects.filter(booking_id=code).exists():
                     self.booking_id = code
                     break
@@ -152,20 +300,32 @@ class Payment(models.Model):
     gateway_order_id = models.CharField(max_length=100, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def save(self, *args, **kwargs):
+def save(self, *args, **kwargs):
         if not self.transaction_id:
             self.transaction_id = f"TXN-{secrets.token_hex(6).upper()}"
         super().save(*args, **kwargs)
 
-    def __str__(self):
+def __str__(self):
         return self.transaction_id
 
-
 class Review(models.Model):
-    booking = models.OneToOneField(Booking, on_delete=models.CASCADE, related_name="review")
-    technician = models.ForeignKey(TechnicianProfile, on_delete=models.CASCADE, related_name="reviews")
-    customer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    rating = models.PositiveIntegerField(validators=[MinValueValidator(1), MaxValueValidator(5)])
+    booking = models.OneToOneField(
+        Booking,
+        on_delete=models.CASCADE,
+        related_name="review",
+    )
+    technician = models.ForeignKey(
+        TechnicianProfile,
+        on_delete=models.CASCADE,
+        related_name="reviews",
+    )
+    customer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+    )
+    rating = models.PositiveIntegerField(
+        validators=[MinValueValidator(1), MaxValueValidator(5)]
+    )
     comment = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     is_hidden = models.BooleanField(default=False)  # admin moderation
@@ -181,7 +341,11 @@ class Review(models.Model):
 
 
 class Notification(models.Model):
-    recipient = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notifications")
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+    )
     title = models.CharField(max_length=100)
     body = models.TextField()
     is_read = models.BooleanField(default=False)
@@ -194,6 +358,10 @@ class Notification(models.Model):
 def notify(recipient, title, body):
     """Create an in-app notification (and print for FCM integration)."""
     if recipient:
-        Notification.objects.create(recipient=recipient, title=title, body=body)
+        Notification.objects.create(
+            recipient=recipient,
+            title=title,
+            body=body,
+        )
         # TODO: replace print with pyfcm/firebase-admin push notification
         print(f"[FCM stub] -> {recipient.username}: {title} | {body}")

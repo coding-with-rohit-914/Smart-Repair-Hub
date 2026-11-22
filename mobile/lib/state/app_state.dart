@@ -1,4 +1,3 @@
-
 import 'package:flutter/foundation.dart';
 
 import '../services/api_service.dart';
@@ -7,20 +6,20 @@ import '../services/api_service.dart';
 class AppState extends ChangeNotifier {
   final api = ApiService();
 
-  bool initialized = false;
+bool initialized = false;
   bool loading = false;
   Map<String, dynamic>? user;
 
-  List<Map<String, dynamic>> categories = [];
+List<Map<String, dynamic>> categories = [];
   List<Map<String, dynamic>> bookings = [];
   List<Map<String, dynamic>> notifications = [];
 
-  String? error;
+String? error;
 
-  bool get isLoggedIn => user != null;
+bool get isLoggedIn => user != null;
   bool get isTechnician => user?['role'] == 'TECHNICIAN';
 
-  Future<void> bootstrap() async {
+Future<void> bootstrap() async {
     try {
       await api.loadToken();
       user = await api.loadUser();
@@ -32,48 +31,53 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     }
 
-    if (isLoggedIn) {
+if (isLoggedIn) {
       await refreshData();
     }
   }
 
-  Future<bool> login(String username, String password) async {
+Future<bool> login(String username, String password) async {
     loading = true;
     error = null;
     notifyListeners();
 
-    var ok = false;
+var ok = false;
 
-    try {
+try {
       debugPrint('LOGIN: Starting API request');
 
-      final res = await api.post(
+final res = await api.post(
         'auth/login/',
         body: {
           'username': username,
           'password': password,
         },
+        allowRefresh: false,
       );
 
-      debugPrint('LOGIN: API response received');
+debugPrint('LOGIN: API response received');
 
-      if (res is! Map ||
+if (res is! Map ||
           res['access'] == null ||
           res['user'] is! Map) {
         throw ApiException('Invalid login response from server.');
       }
 
-      await api.saveToken(res['access'] as String);
+await api.saveToken(res['access'] as String);
 
-      user = (res['user'] as Map).cast<String, dynamic>();
+if (res['refresh'] is String) {
+        await api.saveRefreshToken(res['refresh'] as String);
+      }
 
-      await api.saveUser(user!);
+user = (res['user'] as Map).cast<String, dynamic>();
 
-      debugPrint('LOGIN: Authentication successful');
+await api.saveUser(user!);
 
-      ok = true;
+debugPrint('LOGIN: Authentication successful');
 
-      await refreshData();
+ok = true;
+
+await refreshData();
     } on ApiException catch (e) {
       error = e.message;
       debugPrint('LOGIN API ERROR: ${e.message}');
@@ -86,10 +90,92 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     }
 
-    return ok;
+return ok;
   }
 
-  Future<bool> register({
+/// Step 6 UI: phone OTP login, step 1 - request the code.
+  Future<bool> requestOtp(String phone) async {
+    loading = true;
+    error = null;
+    notifyListeners();
+
+var ok = false;
+
+try {
+      await api.post(
+        'auth/otp/request/',
+        body: {'phone': phone},
+        allowRefresh: false,
+      );
+
+ok = true;
+    } on ApiException catch (e) {
+      error = e.message;
+      debugPrint('OTP REQUEST ERROR: ${e.message}');
+    } catch (e) {
+      error = 'Connection error: ${e.toString()}';
+      debugPrint('OTP REQUEST ERROR: $e');
+    } finally {
+      loading = false;
+      notifyListeners();
+    }
+
+return ok;
+  }
+
+/// Step 6 UI: phone OTP login, step 2 - verify the code and sign in.
+  Future<bool> verifyOtp(String phone, String otp) async {
+    loading = true;
+    error = null;
+    notifyListeners();
+
+var ok = false;
+
+try {
+      final res = await api.post(
+        'auth/otp/verify/',
+        body: {
+          'phone': phone,
+          'otp': otp,
+        },
+        allowRefresh: false,
+      );
+
+if (res is! Map ||
+          res['access'] == null ||
+          res['user'] is! Map) {
+        throw ApiException('Invalid OTP response from server.');
+      }
+
+await api.saveToken(res['access'] as String);
+
+if (res['refresh'] is String) {
+        await api.saveRefreshToken(res['refresh'] as String);
+      }
+
+user = (res['user'] as Map).cast<String, dynamic>();
+
+await api.saveUser(user!);
+
+ok = true;
+
+await refreshData();
+    } on ApiException catch (e) {
+      error = e.message;
+      debugPrint('OTP VERIFY ERROR: ${e.message}');
+    } catch (e, stackTrace) {
+      error = 'Connection error: ${e.toString()}';
+      debugPrint('OTP VERIFY ERROR: $e');
+      debugPrintStack(stackTrace: stackTrace);
+    } finally {
+      loading = false;
+      notifyListeners();
+    }
+
+return ok;
+  }
+
+Future<bool> register({
     required String username,
     required String password,
     required String email,
@@ -100,9 +186,9 @@ class AppState extends ChangeNotifier {
     error = null;
     notifyListeners();
 
-    var ok = false;
+var ok = false;
 
-    try {
+try {
       await api.post(
         'auth/register/',
         body: {
@@ -112,9 +198,10 @@ class AppState extends ChangeNotifier {
           'phone': phone,
           'role': role,
         },
+        allowRefresh: false,
       );
 
-      ok = await login(username, password);
+ok = await login(username, password);
     } on ApiException catch (e) {
       error = e.message;
       debugPrint('REGISTER API ERROR: ${e.message}');
@@ -127,77 +214,77 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     }
 
-    return ok;
+return ok;
   }
 
-  Future<void> logout() async {
+Future<void> logout() async {
     await api.clearToken();
 
-    user = null;
+user = null;
     bookings = [];
     categories = [];
     notifications = [];
     error = null;
 
-    notifyListeners();
+notifyListeners();
   }
 
-  Future<void> refreshData() async {
+Future<void> refreshData() async {
     try {
       final cats = await api.get('categories/');
 
-      final catList = cats is List
+final catList = cats is List
           ? cats
           : (cats['results'] as List? ?? []);
 
-      categories = catList.cast<Map<String, dynamic>>();
+categories = catList.cast<Map<String, dynamic>>();
     } catch (e) {
       debugPrint('CATEGORIES ERROR: $e');
     }
 
-    if (isLoggedIn) {
+if (isLoggedIn) {
       try {
         final bks = await api.get('bookings/');
 
-        final list = bks is List
+final list = bks is List
             ? bks
             : (bks['results'] as List? ?? []);
 
-        bookings = list.cast<Map<String, dynamic>>();
+bookings = list.cast<Map<String, dynamic>>();
       } catch (e) {
         debugPrint('BOOKINGS ERROR: $e');
       }
 
-      try {
+try {
         final notifs = await api.get('notifications/');
 
-        final list = notifs is List
+final list = notifs is List
             ? notifs
             : (notifs['results'] as List? ?? []);
 
-        notifications = list.cast<Map<String, dynamic>>();
+notifications = list.cast<Map<String, dynamic>>();
       } catch (e) {
         debugPrint('NOTIFICATIONS ERROR: $e');
       }
     }
 
-    notifyListeners();
+notifyListeners();
   }
 
-  Future<void> updateProfile(Map<String, dynamic> data) async {
+Future<void> updateProfile(Map<String, dynamic> data) async {
     loading = true;
     error = null;
     notifyListeners();
 
-    try {
+try {
       final res = await api.patch(
         'auth/profile/',
         body: data,
       );
 
-      user = (res as Map).cast<String, dynamic>();
+user = (res as Map).cast<String, dynamic>();
 
-      await api.saveUser(user!);
+await api.saveUser(user!);
     } on ApiException catch (e) {
       error = e.message;
       debugPrint('PROFILE API ERROR: ${e.message}');
