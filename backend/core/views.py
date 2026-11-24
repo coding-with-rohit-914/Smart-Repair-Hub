@@ -474,7 +474,6 @@ class ChangePasswordView(APIView):
 # --------------------------------------------------
 # FORGOT PASSWORD (EMAIL OTP)
 # --------------------------------------------------
-
 class RequestPasswordOtpView(APIView):
     """Forgot password, step 1: email -> hashed reset OTP."""
 
@@ -485,6 +484,7 @@ class RequestPasswordOtpView(APIView):
         responses={
             200: _MessageResponseSerializer,
             429: None,
+            503: None,
         },
     )
     def post(self, request):
@@ -502,29 +502,33 @@ class RequestPasswordOtpView(APIView):
 
         if not user:
             logger.info(
-                "Password reset OTP requested for unknown email.",
+                "Password reset OTP requested for unknown email."
             )
             return Response(generic)
 
-        # Resend cooldown (same constant as the phone OTP flow).
+        # Resend cooldown.
         if user.otp_in_cooldown():
             logger.warning(
-                "Password reset OTP resend blocked by cooldown (user_id=%s).",
+                "Password reset OTP resend blocked by cooldown "
+                "(user_id=%s).",
                 user.pk,
             )
+
             return Response(
                 {
                     "error": (
                         "Please wait before requesting another code. "
-                        f"Try again in {user.OTP_RESEND_COOLDOWN_SECONDS} seconds."
+                        f"Try again in "
+                        f"{user.OTP_RESEND_COOLDOWN_SECONDS} seconds."
                     )
                 },
                 status=429,
             )
 
+        # Generate a six-digit OTP.
         otp = f"{secrets.randbelow(1000000):06d}"
 
-        # Store only the PBKDF2 hash of the OTP, never the OTP itself.
+        # Store only the hashed OTP.
         user.otp_hash = make_password(otp)
         user.otp_purpose = "PASSWORD_RESET"
         user.otp_attempts = 0
@@ -539,30 +543,54 @@ class RequestPasswordOtpView(APIView):
             ]
         )
 
+        # Send password reset email.
         try:
             send_mail(
-                subject="Smart Repair Hub — Password Reset Code",
-                message=(f"Your password reset code is: {otp}\n\n"
+                subject="Smart Repair Hub - Password Reset Code",
+                message=(
+                    f"Your password reset code is: {otp}\n\n"
                     "This code expires in 10 minutes.\n"
                     "If you did not request a password reset, "
                     "you can safely ignore this email."
                 ),
-                from_email=None,  # uses DEFAULT_FROM_EMAIL from settings
+                from_email=None,
                 recipient_list=[user.email],
                 fail_silently=False,
             )
+
         except Exception:
-            # Log the failure with full traceback; never expose internals
-            # to the API caller beyond a generic message.
             logger.exception(
-                "Password reset OTP email failed (user_id=%s).",
+                "Password reset OTP email failed "
+                "(user_id=%s).",
                 user.pk,
             )
-            return Response(
-                {"error": "Could not send the email right now. Please try again."},
-                status=500,
+
+            # Do not leave an undelivered OTP usable.
+            user.otp_hash = ""
+            user.otp_purpose = ""
+            user.otp_attempts = 0
+            user.otp_requested_at = None
+
+            user.save(
+                update_fields=[
+                    "otp_hash",
+                    "otp_purpose",
+                    "otp_attempts",
+                    "otp_requested_at",
+                ]
             )
-        # Optional: also keep the in-app notification record
+
+            return Response(
+                {
+                    "error": (
+                        "Email service is temporarily unavailable. "
+                        "Please try again later."
+                    )
+                },
+                status=503,
+            )
+
+        # Create in-app notification after successful email delivery.
         notify(
             user,
             "Password Reset",
@@ -570,14 +598,14 @@ class RequestPasswordOtpView(APIView):
         )
 
         logger.info(
-            "Password reset OTP generated (user_id=%s).",
+            "Password reset OTP generated and email sent "
+            "(user_id=%s).",
             user.pk,
-        )  # OTP value never logged
+        )
 
         response = dict(generic)
 
         if OTP_DEV_MODE:
-            # Local development convenience only.
             response["otp"] = otp
 
         return Response(response)
