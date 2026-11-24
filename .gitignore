@@ -10,7 +10,7 @@ pip-log.txt
 # ===== Secrets / environment =====
 .env
 .env.local
-.env.production
+.env.prod
 *.pem
 *.key
 

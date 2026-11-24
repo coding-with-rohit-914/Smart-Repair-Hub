@@ -1,4 +1,3 @@
-
 """API views: auth (JWT/OTP), categories, bookings, payments, reviews, notifications."""
 
 import logging
@@ -6,6 +5,9 @@ import math
 import os
 import secrets
 
+import resend
+
+from django.conf import settings
 from django.contrib.auth import authenticate
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import transaction
@@ -18,7 +20,6 @@ from rest_framework import generics, serializers
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from django.core.mail import send_mail
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
@@ -49,8 +50,8 @@ from .serializers import (
 
 logger = logging.getLogger("core")
 
-# Dev-only override: when "True", OTP responses include the OTP so you can
-# test locally without console/SMS. NEVER enable in production.
+# Dev-only override: when "True", OTP responses include the OTP.
+# NEVER enable this in production.
 OTP_DEV_MODE = os.getenv("OTP_DEV_MODE", "False").lower() in (
     "1",
     "true",
@@ -474,6 +475,10 @@ class ChangePasswordView(APIView):
 # --------------------------------------------------
 # FORGOT PASSWORD (EMAIL OTP)
 # --------------------------------------------------
+# --------------------------------------------------
+# FORGOT PASSWORD (EMAIL OTP)
+# --------------------------------------------------
+
 class RequestPasswordOtpView(APIView):
     """Forgot password, step 1: email -> hashed reset OTP."""
 
@@ -505,6 +510,33 @@ class RequestPasswordOtpView(APIView):
                 "Password reset OTP requested for unknown email."
             )
             return Response(generic)
+
+        # Check email provider configuration.
+        api_key = getattr(settings, "RESEND_API_KEY", "")
+        from_email = getattr(
+            settings,
+            "RESEND_FROM_EMAIL",
+            "onboarding@resend.dev",
+        )
+        email_provider = getattr(
+            settings,
+            "EMAIL_PROVIDER",
+            "console",
+        ).lower()
+
+        if email_provider != "resend" or not api_key:
+            logger.error(
+                "Resend email configuration is missing or invalid."
+            )
+            return Response(
+                {
+                    "error": (
+                        "Email service is temporarily unavailable. "
+                        "Please try again later."
+                    )
+                },
+                status=503,
+            )
 
         # Resend cooldown.
         if user.otp_in_cooldown():
@@ -543,20 +575,72 @@ class RequestPasswordOtpView(APIView):
             ]
         )
 
-        # Send password reset email.
+        # Send password reset email using Resend HTTPS API.
         try:
-            send_mail(
-                subject="Smart Repair Hub - Password Reset Code",
-                message=(
-                    f"Your password reset code is: {otp}\n\n"
+            resend.api_key = api_key
+
+            resend.Emails.send({
+                "from": from_email,
+                "to": [user.email],
+                "subject": "Smart Repair Hub - Password Reset Code",
+                "text": (
+                    f"Your Smart Repair Hub password reset code is: {otp}\n\n"
                     "This code expires in 10 minutes.\n"
                     "If you did not request a password reset, "
                     "you can safely ignore this email."
                 ),
-                from_email=None,
-                recipient_list=[user.email],
-                fail_silently=False,
-            )
+                "html": f"""
+                    <div style="
+                        font-family: Arial, sans-serif;
+                        max-width: 520px;
+                        margin: 20px auto;
+                        padding: 24px;
+                        border: 1px solid #e5e7eb;
+                        border-radius: 12px;
+                    ">
+                        <h2 style="color: #111827;">
+                            Smart Repair Hub
+                        </h2>
+
+                        <p style="color: #374151;">
+                            You requested to reset your password.
+                            Use the verification code below:
+                        </p>
+
+                        <div style="
+                            margin: 24px 0;
+                            padding: 16px;
+                            text-align: center;
+                            background: #f3f4f6;
+                            border-radius: 8px;
+                            font-size: 30px;
+                            font-weight: bold;
+                            letter-spacing: 8px;
+                            color: #111827;
+                        ">
+                            {otp}
+                        </div>
+
+                        <p style="color: #6b7280;">
+                            This code expires in 10 minutes.
+                        </p>
+
+                        <p style="color: #6b7280;">
+                            If you did not request a password reset,
+                            you can safely ignore this email.
+                        </p>
+
+                        <hr style="border: 0; border-top: 1px solid #e5e7eb;">
+
+                        <p style="
+                            font-size: 12px;
+                            color: #9ca3af;
+                        ">
+                            Smart Repair Hub - Automated Email
+                        </p>
+                    </div>
+                """,
+            })
 
         except Exception:
             logger.exception(
@@ -569,14 +653,12 @@ class RequestPasswordOtpView(APIView):
             user.otp_hash = ""
             user.otp_purpose = ""
             user.otp_attempts = 0
-            user.otp_requested_at = None
 
             user.save(
                 update_fields=[
                     "otp_hash",
                     "otp_purpose",
                     "otp_attempts",
-                    "otp_requested_at",
                 ]
             )
 
@@ -590,7 +672,7 @@ class RequestPasswordOtpView(APIView):
                 status=503,
             )
 
-        # Create in-app notification after successful email delivery.
+        # Create in-app notification after successful email submission.
         notify(
             user,
             "Password Reset",
@@ -598,7 +680,7 @@ class RequestPasswordOtpView(APIView):
         )
 
         logger.info(
-            "Password reset OTP generated and email sent "
+            "Password reset OTP submitted to Resend "
             "(user_id=%s).",
             user.pk,
         )
@@ -609,7 +691,6 @@ class RequestPasswordOtpView(APIView):
             response["otp"] = otp
 
         return Response(response)
-
 
 class VerifyPasswordOtpView(APIView):
     """Forgot password, step 2: confirm the code before showing the

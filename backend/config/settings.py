@@ -1,3 +1,4 @@
+
 """Django settings for the Smart Repair Hub backend."""
 
 import os
@@ -10,19 +11,19 @@ try:
 except ImportError:
     pass
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 # --------------------------------------------------
 # Security
 # --------------------------------------------------
+
 SECRET_KEY = os.getenv(
     "DJANGO_SECRET_KEY",
     "dev-insecure-secret-key-change-me",
 )
 
-# NOTE: default kept as True so the live Render deployment behaves exactly
-# as it does today. Harden later (Step: Production Hardening) by setting
-# DJANGO_DEBUG=False on Render together with CORS_ALLOWED_ORIGINS.
 DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() in (
     "1", "true", "yes",
 )
@@ -36,9 +37,11 @@ ALLOWED_HOSTS = [
     if host.strip()
 ]
 
+
 # --------------------------------------------------
 # Applications
 # --------------------------------------------------
+
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -53,6 +56,10 @@ INSTALLED_APPS = [
 ]
 
 
+# --------------------------------------------------
+# Middleware
+# --------------------------------------------------
+
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
@@ -64,6 +71,7 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
+
 
 ROOT_URLCONF = "config.urls"
 
@@ -87,9 +95,11 @@ WSGI_APPLICATION = "config.wsgi.application"
 
 AUTH_USER_MODEL = "core.User"
 
+
 # --------------------------------------------------
 # Database
 # --------------------------------------------------
+
 DATABASES = {
     "default": {
         "ENGINE": os.getenv(
@@ -107,9 +117,11 @@ DATABASES = {
     }
 }
 
+
 # --------------------------------------------------
 # Django REST Framework
 # --------------------------------------------------
+
 REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -126,8 +138,9 @@ REST_FRAMEWORK = {
 
 
 # --------------------------------------------------
-# JWT configuration (env-driven, same defaults as before)
+# JWT Configuration
 # --------------------------------------------------
+
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(
         minutes=int(os.getenv("JWT_ACCESS_MINUTES", "1440"))
@@ -138,9 +151,11 @@ SIMPLE_JWT = {
     "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
+
 # --------------------------------------------------
-# drf-spectacular (Swagger / OpenAPI docs)
+# drf-spectacular (Swagger / OpenAPI)
 # --------------------------------------------------
+
 SPECTACULAR_SETTINGS = {
     "TITLE": "Smart Repair Hub API",
     "DESCRIPTION": (
@@ -159,6 +174,7 @@ SPECTACULAR_SETTINGS = {
 # --------------------------------------------------
 # CORS
 # --------------------------------------------------
+
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -171,10 +187,30 @@ CORS_ALLOWED_ORIGINS = [
 CORS_ALLOW_ALL_ORIGINS = DEBUG
 CORS_ALLOW_CREDENTIALS = True
 
+
 # --------------------------------------------------
-# SMTP Email (OTP / Password Reset)
+# Email Configuration - Resend API
 # --------------------------------------------------
 
+EMAIL_PROVIDER = os.getenv(
+    "EMAIL_PROVIDER",
+    "console",
+).lower()
+
+RESEND_API_KEY = os.getenv(
+    "RESEND_API_KEY",
+    "",
+)
+
+RESEND_FROM_EMAIL = os.getenv(
+    "RESEND_FROM_EMAIL",
+    "onboarding@resend.dev",
+)
+
+DEFAULT_FROM_EMAIL = RESEND_FROM_EMAIL
+
+# SMTP configuration retained for optional local fallback.
+# Render Free blocks outbound SMTP ports.
 EMAIL_BACKEND = os.getenv(
     "EMAIL_BACKEND",
     "django.core.mail.backends.console.EmailBackend",
@@ -196,29 +232,29 @@ EMAIL_USE_SSL = os.getenv(
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
 
-DEFAULT_FROM_EMAIL = os.getenv(
-    "DEFAULT_FROM_EMAIL",
-    "Smart Repair Hub <noreply@example.com>",
-)
-
-# Important: Prevent SMTP connections from hanging indefinitely.
 EMAIL_TIMEOUT = int(
     os.getenv("EMAIL_TIMEOUT", "10")
 )
 
+
 # --------------------------------------------------
 # Internationalization
 # --------------------------------------------------
+
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Kolkata"
+
 USE_I18N = True
 USE_TZ = True
 
+
 # --------------------------------------------------
-# Static & media
+# Static & Media
 # --------------------------------------------------
+
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
@@ -227,17 +263,20 @@ STORAGES = {
         "BACKEND": "django.core.files.storage.FileSystemStorage",
     },
     "staticfiles": {
-        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+        "BACKEND": (
+            "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        ),
     },
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+
 # --------------------------------------------------
 # Logging
-# Never log passwords, OTPs, tokens, or emails' contents.
-# Console in production (Render collects it); rotating file locally.
+# Never log passwords, OTPs, API keys or email contents.
 # --------------------------------------------------
+
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
@@ -265,14 +304,14 @@ LOGGING = {
         "file": {
             "class": "logging.handlers.RotatingFileHandler",
             "filename": str(LOG_DIR / "smart_repair_hub.log"),
-            "maxBytes": 5 * 1024 * 1024,   # 5 MB
+            "maxBytes": 5 * 1024 * 1024,
             "backupCount": 3,
             "formatter": "verbose",
             "level": "INFO",
         },
     },
     "root": {
-        "handlers": ["console"] + ([] if DEBUG else []),
+        "handlers": ["console"],
         "level": "INFO",
     },
     "loggers": {
@@ -296,7 +335,9 @@ LOGGING = {
             "level": "INFO",
             "propagate": False,
         },
-        # Quiet noisy 3rd-party debug noise
-        "whitenoise": {"handlers": ["console"], "level": "WARNING"},
+        "whitenoise": {
+            "handlers": ["console"],
+            "level": "WARNING",
+        },
     },
 }
